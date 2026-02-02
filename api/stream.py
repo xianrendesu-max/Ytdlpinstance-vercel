@@ -1,42 +1,51 @@
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-import yt_dlp
-import tempfile
-import os
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from yt_dlp import YoutubeDL
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+app = FastAPI(title="YT Stream API")
 
-@app.get("/api/stream")
-async def stream_video(url: str):
+# CORS許可（フロントからのアクセス用）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/stream/{video_id}")
+def stream(video_id: str, quality: str = "best"):
     """
-    簡単なVercel向けMP4ストリーミングAPI
-    URLパラメータでYouTubeなどの動画を取得してストリーム配信
+    video_id: YouTube動画ID
+    quality: 'best'または'360p', '720p'など
     """
-    # 一時ファイルに動画を保存
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tmp_path = tmp_file.name
-    tmp_file.close()
+    url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # yt-dlpで動画を取得
     ydl_opts = {
-        "format": "best",
-        "outtmpl": tmp_path,
-        "quiet": True,  # ログ抑制
-        "noplaylist": True  # プレイリストは無視
+        'format': 'bestaudio/best' if quality == "best" else quality,
+        'quiet': True,
+        'skip_download': True,
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
     except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        return {"error": str(e)}
+        raise HTTPException(status_code=503, detail=f"Video not found: {e}")
 
-    # StreamingResponseで配信
-    def iterfile():
-        with open(tmp_path, "rb") as f:
-            yield from f
-        os.remove(tmp_path)  # 配信後に削除
+    # フィルタして日本語優先も可能
+    formats = info.get("formats", [])
+    for f in formats:
+        if f.get("url"):
+            # 日本語音声優先の簡易チェック
+            lang = (f.get("language") or "").lower()
+            audio_track = str(f.get("audioTrack") or "").lower()
+            if "en" in lang or "english" in audio_track:
+                continue
+            return RedirectResponse(f["url"])
 
-    return StreamingResponse(iterfile(), media_type="video/mp4")
+    # 条件に合わなければベストURL
+    if formats:
+        return RedirectResponse(formats[0]["url"])
+
+    raise HTTPException(status_code=503, detail="Stream unavailable")
