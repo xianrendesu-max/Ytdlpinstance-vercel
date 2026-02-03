@@ -1,4 +1,6 @@
 fastapi
 uvicorn
 yt-dlp
-requests
+pydantic
+asyncio
+gunicorn
