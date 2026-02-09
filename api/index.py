@@ -16,109 +16,238 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- スレッドプール ---
 executor = ThreadPoolExecutor()
 
-ydl_opts = {
+# --- yt-dlp 基本設定 ---
+ydl_opts_base = {
     "quiet": True,
     "skip_download": True,
     "nocheckcertificate": True,
-    "format": "bestvideo+bestaudio/best",
+    "format": "best",
     "proxy": "http://ytproxy-siawaseok.duckdns.org:3007"
 }
 
-# キャッシュと処理中リスト
-CACHE = {}
-PROCESSING_IDS = set()  # 現在処理中の video_id を保持
-DEFAULT_CACHE_DURATION = 600
-LONG_CACHE_DURATION = 14200
+ydl_opts_flat = {
+    **ydl_opts_base,
+    "extract_flat": "in_playlist",
+    "playlist_items": "1-50",
+    "lazy_playlist": True,
+}
 
+# --- キャッシュ & 処理中管理 ---
+VIDEO_CACHE = {}      # { id: (timestamp, data, duration) }
+PLAYLIST_CACHE = {}
+CHANNEL_CACHE = {}
+PROCESSING_IDS = set()
+
+DEFAULT_CACHE_DURATION = 600    # 10分
+LONG_CACHE_DURATION = 14200     # 約4時間
+CHANNEL_CACHE_DURATION = 86400  # 24時間
+
+# --- キャッシュ管理 ---
 def cleanup_cache():
+    """期限切れのキャッシュをクリーンアップ"""
     now = time.time()
-    expired = [vid for vid, (ts, _, dur) in CACHE.items() if now - ts >= dur]
-    for vid in expired:
-        del CACHE[vid]
+    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
+        expired = [k for k, (ts, _, dur) in cache.items() if now - ts >= dur]
+        for k in expired:
+            del cache[k]
 
-@app.get("/stream/{video_id}")
-async def get_streams(video_id: str):
-    current_time = time.time()
-    cleanup_cache()
-
-    if video_id in CACHE:
-        timestamp, data, duration = CACHE[video_id]
-        if current_time - timestamp < duration:
+def get_cache(cache, key):
+    """キャッシュ取得。期限切れならNone"""
+    if key in cache:
+        ts, data, dur = cache[key]
+        if time.time() - ts < dur:
             return data
+        del cache[key]
+    return None
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
+def set_cache(cache, key, data, duration):
+    cache[key] = (time.time(), data, duration)
 
-    def fetch_info():
-        with YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
+# --- システム・管理 API ---
+@app.get("/status")
+def get_status():
+    """現在非同期処理中のID一覧を返す"""
+    return {
+        "processing_count": len(PROCESSING_IDS),
+        "processing_ids": list(PROCESSING_IDS)
+    }
 
-    # --- 処理中管理の追加 ---
-    PROCESSING_IDS.add(video_id)
-    try:
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(executor, fetch_info)
+@app.get("/api/2/cache")
+def list_cache():
+    """すべてのキャッシュ状況をカテゴリ別に表示"""
+    now = time.time()
+    def format_map(c):
+        return {
+            k: {
+                "age_sec": int(now - v[0]),
+                "remaining_sec": int(v[2] - (now - v[0])),
+                "total_duration": v[2]
+            } for k, v in c.items()
+        }
+    return {
+        "video_streams": format_map(VIDEO_CACHE),
+        "playlists": format_map(PLAYLIST_CACHE),
+        "channels": format_map(CHANNEL_CACHE)
+    }
 
-        formats = [
-            {
+@app.delete("/api/2/cache/{item_id}")
+def delete_cache(item_id: str):
+    """指定したIDのキャッシュを削除"""
+    deleted = False
+    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
+        if item_id in cache:
+            del cache[item_id]
+            deleted = True
+    if deleted:
+        return {"status": "success", "message": f"ID: {item_id} のキャッシュを削除しました。"}
+    raise HTTPException(status_code=404, detail="キャッシュが存在しません。")
+
+# --- 内部ヘルパー ---
+async def run_in_executor(func):
+    """スレッドプールで同期処理を非同期実行"""
+    return await asyncio.to_thread(func)
+
+def extract_formats(info, filter_mhtml=True):
+    """動画情報からストリームフォーマットを抽出"""
+    formats = []
+    for f in info.get("formats", []):
+        if f.get("url") and (not filter_mhtml or f.get("ext") != "mhtml"):
+            formats.append({
                 "itag": f.get("format_id"),
                 "ext": f.get("ext"),
                 "resolution": f.get("resolution"),
-                "fps": f.get("fps"),
-                "acodec": f.get("acodec"),
-                "vcodec": f.get("vcodec"),
                 "url": f.get("url")
-            }
-            for f in info.get("formats", [])
-            if f.get("url") and f.get("ext") != "mhtml"
-        ]
+            })
+    return formats
 
-        response_data = {
-            "title": info.get("title"),
-            "id": video_id,
-            "formats": formats
-        }
+# --- メイン API ---
+@app.get("/stream/{video_id}")
+async def get_streams(video_id: str):
+    cleanup_cache()
+    cached = get_cache(VIDEO_CACHE, video_id)
+    if cached: 
+        return cached
 
-        cache_duration = LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
-        CACHE[video_id] = (current_time, response_data, cache_duration)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    PROCESSING_IDS.add(video_id)
+    try:
+        def fetch():
+            with YoutubeDL(ydl_opts_base) as ydl:
+                return ydl.extract_info(url, download=False)
 
-        return response_data
+        info = await run_in_executor(fetch)
+        formats = extract_formats(info)
 
+        dur = LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
+        res = {"title": info.get("title"), "id": video_id, "formats": formats}
+        set_cache(VIDEO_CACHE, video_id, res, dur)
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # 成功・失敗に関わらず、終わったら処理中リストから削除
-        if video_id in PROCESSING_IDS:
-            PROCESSING_IDS.remove(video_id)
+        PROCESSING_IDS.discard(video_id)
 
-# --- 処理状況確認用API ---
-@app.get("/status")
-def get_status():
-    """現在処理中のIDとキャッシュされているIDのサマリーを返す"""
-    return {
-        "processing_count": len(PROCESSING_IDS),
-        "processing_ids": list(PROCESSING_IDS),
-        "cache_count": len(CACHE)
-    }
+@app.get("/m3u8/{video_id}")
+async def get_m3u8(video_id: str):
+    """iOS User-Agentを使用してHLS(m3u8)マニフェストURLを抽出"""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    PROCESSING_IDS.add(video_id)
+    try:
+        def fetch():
+            opts = {**ydl_opts_base,
+                    "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"}
+            with YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
 
-@app.delete("/cache/{video_id}")
-def delete_cache(video_id: str):
-    if video_id in CACHE:
-        del CACHE[video_id]
-        return {"status": "success", "message": f"{video_id} のキャッシュを削除しました。"}
-    else:
-        raise HTTPException(status_code=404, detail="指定されたIDのキャッシュは存在しません。")
+        info = await run_in_executor(fetch)
+        streams = [
+            {
+                "url": f.get("url"),
+                "resolution": f.get("resolution"),
+                "protocol": f.get("protocol"),
+                "ext": f.get("ext")
+            }
+            for f in info.get("formats", [])
+            if f.get("protocol") == "m3u8_native" or ".m3u8" in f.get("url", "")
+        ]
+        if not streams and info.get("hls_url"):
+            streams.append({
+                "url": info.get("hls_url"),
+                "resolution": "adaptive",
+                "protocol": "m3u8_native",
+                "ext": "m3u8"
+            })
 
-@app.get("/cache")
-def list_cache():
-    now = time.time()
-    return {
-        vid: {
-            "age_sec": int(now - ts),
-            "remaining_sec": int(dur - (now - ts)),
-            "duration_sec": dur,
-            "is_processing": vid in PROCESSING_IDS  # 個別のキャッシュ情報にも処理中かを入れる
-        }
-        for vid, (ts, _, dur) in CACHE.items()
-    }
+        return {"title": info.get("title"), "video_id": video_id, "m3u8_streams": streams}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(video_id)
+
+# --- プレイリスト API ---
+@app.get("/playlist/{playlist_id}")
+async def get_playlist(playlist_id: str):
+    cleanup_cache()
+    cached = get_cache(PLAYLIST_CACHE, playlist_id)
+    if cached:
+        return cached
+
+    url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    if playlist_id.startswith("RD"):
+        url = f"https://www.youtube.com/watch?list={playlist_id}"
+
+    PROCESSING_IDS.add(playlist_id)
+    try:
+        def fetch():
+            with YoutubeDL(ydl_opts_flat) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        info = await run_in_executor(fetch)
+        entries = [
+            {
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "thumbnail": e.get("thumbnails", [{}])[-1].get("url") if e.get("thumbnails") else None
+            } for e in info.get("entries", []) if e
+        ]
+        res = {"id": playlist_id, "title": info.get("title"), "video_count": len(entries), "entries": entries}
+        set_cache(PLAYLIST_CACHE, playlist_id, res, LONG_CACHE_DURATION)
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(playlist_id)
+
+# --- チャンネル API ---
+@app.get("/channel/{channel_id}")
+async def get_channel(channel_id: str):
+    cleanup_cache()
+    cached = get_cache(CHANNEL_CACHE, channel_id)
+    if cached:
+        return cached
+
+    url = f"https://www.youtube.com/{channel_id}/videos" if channel_id.startswith("@") else f"https://www.youtube.com/channel/{channel_id}/videos"
+    PROCESSING_IDS.add(channel_id)
+    try:
+        def fetch():
+            with YoutubeDL(ydl_opts_flat) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        info = await run_in_executor(fetch)
+        videos = [
+            {
+                "id": e.get("id"),
+                "title": e.get("title"),
+                "view_count": e.get("view_count")
+            } for e in info.get("entries", []) if e
+        ]
+        res = {"channel_id": info.get("id"), "name": info.get("uploader") or info.get("channel"), "videos": videos}
+        set_cache(CHANNEL_CACHE, channel_id, res, CHANNEL_CACHE_DURATION)
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(channel_id)
