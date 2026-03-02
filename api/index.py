@@ -39,6 +39,7 @@ ydl_opts_flat = {
 VIDEO_CACHE = {}      # { id: (timestamp, data, duration) }
 PLAYLIST_CACHE = {}
 CHANNEL_CACHE = {}
+COMMENT_CACHE = {}    # コメント用キャッシュを追加
 PROCESSING_IDS = set()
 
 DEFAULT_CACHE_DURATION = 600    # 10分
@@ -49,7 +50,7 @@ CHANNEL_CACHE_DURATION = 86400  # 24時間
 def cleanup_cache():
     """期限切れのキャッシュをクリーンアップ"""
     now = time.time()
-    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
+    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, COMMENT_CACHE]:
         expired = [k for k, (ts, _, dur) in cache.items() if now - ts >= dur]
         for k in expired:
             del cache[k]
@@ -90,14 +91,15 @@ def list_cache():
     return {
         "video_streams": format_map(VIDEO_CACHE),
         "playlists": format_map(PLAYLIST_CACHE),
-        "channels": format_map(CHANNEL_CACHE)
+        "channels": format_map(CHANNEL_CACHE),
+        "comments": format_map(COMMENT_CACHE)
     }
 
 @app.delete("/api/2/cache/{item_id}")
 def delete_cache(item_id: str):
     """指定したIDのキャッシュを削除"""
     deleted = False
-    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE]:
+    for cache in [VIDEO_CACHE, PLAYLIST_CACHE, CHANNEL_CACHE, COMMENT_CACHE]:
         if item_id in cache:
             del cache[item_id]
             deleted = True
@@ -182,6 +184,56 @@ async def get_m3u8(video_id: str):
             })
 
         return {"title": info.get("title"), "video_id": video_id, "m3u8_streams": streams}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        PROCESSING_IDS.discard(video_id)
+
+# --- コメント API ---
+@app.get("/comments/{video_id}")
+async def get_comments(video_id: str):
+    """動画のコメントを取得"""
+    cleanup_cache()
+    cached = get_cache(COMMENT_CACHE, video_id)
+    if cached:
+        return cached
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    PROCESSING_IDS.add(video_id)
+    try:
+        def fetch():
+            # コメント取得用の設定
+            opts = {
+                **ydl_opts_base,
+                "get_comments": True,
+                "extract_flat": False, # コメント取得には詳細情報の抽出が必要
+                "playlist_items": "0",  # プレイリストとして処理されないようにする
+            }
+            with YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        info = await run_in_executor(fetch)
+        raw_comments = info.get("comments", [])
+        
+        comments = [
+            {
+                "author": c.get("author"),
+                "author_id": c.get("author_id"),
+                "text": c.get("text"),
+                "like_count": c.get("like_count"),
+                "time_text": c.get("time_text"),
+                "is_favorited": c.get("is_favorited"),
+                "author_thumbnail": c.get("author_thumbnail")
+            } for c in raw_comments
+        ]
+
+        res = {
+            "video_id": video_id,
+            "comment_count": len(comments),
+            "comments": comments
+        }
+        set_cache(COMMENT_CACHE, video_id, res, DEFAULT_CACHE_DURATION)
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
