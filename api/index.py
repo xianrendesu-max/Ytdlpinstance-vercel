@@ -386,10 +386,14 @@ async def get_channel(channel_id: str):
     finally:
         PROCESSING_IDS.discard(channel_id)
 
-
-# --- 追加: 全フォーマット取得 API ---
+# --- video API（stream方式に変更） ---
 @app.get("/video/{video_id}")
 async def get_video_formats(video_id: str):
+
+    cleanup_cache()
+    cached = get_cache(VIDEO_CACHE, video_id)
+    if cached:
+        return cached
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     PROCESSING_IDS.add(video_id)
@@ -400,30 +404,13 @@ async def get_video_formats(video_id: str):
                 return ydl.extract_info(url, download=False)
 
         info = await run_in_executor(fetch)
+        formats = extract_formats(info)
 
-        formats = []
+        dur = LONG_CACHE_DURATION if len(formats) >= 12 else DEFAULT_CACHE_DURATION
+        res = {"title": info.get("title"), "id": video_id, "formats": formats}
+        set_cache(VIDEO_CACHE, video_id, res, dur)
 
-        for f in info.get("formats", []):
-            if f.get("url"):
-                formats.append({
-                    "itag": f.get("format_id"),
-                    "ext": f.get("ext"),
-                    "format": f.get("format"),
-                    "resolution": f.get("resolution"),
-                    "fps": f.get("fps"),
-                    "vcodec": f.get("vcodec"),
-                    "acodec": f.get("acodec"),
-                    "filesize": f.get("filesize"),
-                    "protocol": f.get("protocol"),
-                    "url": f.get("url")
-                })
-
-        return {
-            "title": info.get("title"),
-            "video_id": video_id,
-            "format_count": len(formats),
-            "formats": formats
-        }
+        return res
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
