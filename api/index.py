@@ -188,7 +188,6 @@ async def get_m3u8(video_id: str):
             )
         ]
 
-        # --- fallback: m3u8が無い場合 httpsストリームを返す ---
         if not streams:
             streams = [
                 {
@@ -386,3 +385,48 @@ async def get_channel(channel_id: str):
 
     finally:
         PROCESSING_IDS.discard(channel_id)
+
+
+# --- 追加: 全フォーマット取得 API ---
+@app.get("/video/{video_id}")
+async def get_video_formats(video_id: str):
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    PROCESSING_IDS.add(video_id)
+
+    try:
+        def fetch():
+            with YoutubeDL(ydl_opts_base) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        info = await run_in_executor(fetch)
+
+        formats = []
+
+        for f in info.get("formats", []):
+            if f.get("url"):
+                formats.append({
+                    "itag": f.get("format_id"),
+                    "ext": f.get("ext"),
+                    "format": f.get("format"),
+                    "resolution": f.get("resolution"),
+                    "fps": f.get("fps"),
+                    "vcodec": f.get("vcodec"),
+                    "acodec": f.get("acodec"),
+                    "filesize": f.get("filesize"),
+                    "protocol": f.get("protocol"),
+                    "url": f.get("url")
+                })
+
+        return {
+            "title": info.get("title"),
+            "video_id": video_id,
+            "format_count": len(formats),
+            "formats": formats
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        PROCESSING_IDS.discard(video_id)
