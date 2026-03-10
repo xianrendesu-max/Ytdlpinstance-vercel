@@ -6,3 +6,7 @@ python-multipart>=0.0.6
 pysocks>=1.7.1
 requests[socks]>=2.31.0
 pytube
+aiofiles>=23.2.1
+anyio>=4.2.0
+h11>=0.14.0
+websockets>=12.0
